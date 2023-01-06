@@ -1,0 +1,545 @@
+# Addendum to Cirrus
+
+This is an organic document describing the relationship between the Cirrus server and WildTrax. The document is written in Rmarkdown, appended via the `knitr` package and converted to PDF via `pandoc`. Knitting and converting is also known as *rendering* the document.
+
+```{r, eval=T, include=T, message=F, warning=F}
+# Knit the chunks together and print the output by default
+knitr::opts_chunk$set(echo = T)
+
+# For a true reprex, install the development version of wildRtrax
+# remotes::install_github("ABbiodiversity/wildRtrax@development")
+
+# Load required packages
+library(tidyverse) # Opinionated collection of packages for data tidying and data science
+library(lubridate) # Make it easier to deal with date-times
+library(future) # Implementation of multisession futures (used in wildRtrax)
+library(pipeR) # Styles for function chaining
+library(furrr) # Applying mapping functions in parallel
+library(fs) # For file reading and manipulation
+library(tictoc) # Timing scripts
+
+```
+
+```{r setup, include=F, eval=T, warning=F, message=F}
+
+wt_audio_scanner <- function(path, file_type, extra_cols = F, tz = "") {
+  # Create regex for file_type
+  if (file_type == "wav" || file_type == "WAV") {
+    file_type_reg <- "\\.wav$|\\.WAV$"
+  } else if (file_type == "wac") {
+    file_type_reg <- "\\.wac$"
+  } else if (file_type == "flac") {
+    file_type_reg <- "\\.flac$"
+  } else if (file_type == "all") {
+    file_type_reg <- "\\.wav$|\\.wac$|\\.WAV$|\\.flac$"
+  } else {
+    # Throw error if the file_type is not set to wav, wac, or both.
+    stop (
+      "For now, this function can only be used for wav, wac and/of flac files. Please specify either 'wac', 'wav', 'flac' or 'all' with the file_type argument."
+    )
+  }
+
+  # Scan files, gather metadata
+  df <- tibble::as_tibble(x = path) %>>%
+    "Scanning audio files in path ..." %>>%
+    dplyr::mutate(file_path = furrr::future_map(.x = value, .f = ~ fs::dir_ls(path = .x, regexp = file_type_reg, recurse = T, fail = F), .progress = TRUE, .options = furrr_options(seed = TRUE))) %>%
+    tidyr::unnest(file_path) %>%
+    dplyr::mutate(file_size = furrr::future_map_dbl(.x = file_path, .f = ~ fs::file_size(.x), .progress = TRUE, .options = furrr_options(seed = TRUE))) %>%
+    dplyr::mutate(file_path = as.character(file_path)) %>%
+    dplyr::mutate(size_Mb = round(file_size / 10e5, digits = 2)) %>% # Convert file sizes to megabytes
+    dplyr::select(-file_size) %>%
+    dplyr::mutate(unsafe = dplyr::case_when(size_Mb <= 0.5 ~ "Unsafe", TRUE ~ "Safe")) %>% #Create safe scanning protocol, pretty much based on file size
+    dplyr::select(file_path, size_Mb, unsafe) %>%
+    dplyr::mutate(file_name = stringr::str_replace(basename(file_path), "\\..*", "")) %>%
+    dplyr::mutate(file_type = tolower(tools::file_ext(file_path))) %>%
+    # Parse location and recording date time
+    tidyr::separate(file_name, into = c("location", "recording_date_time"), sep = "(?:_0\\+1_|_|__0__|__1__)", extra = "merge", remove = FALSE) %>% # Strips Wildlife Acoustics SM3 file naming convention for channels
+    dplyr::mutate(recording_date_time = str_remove(recording_date_time, '.+?(?:__)')) %>%
+    # Create date/time fields
+    dplyr::mutate(recording_date_time = case_when(tz == "" ~ lubridate::ymd_hms(recording_date_time), TRUE ~ lubridate::with_tz(lubridate::ymd_hms(recording_date_time), tzone = tz)),
+                  julian = lubridate::yday(recording_date_time),
+                  year = lubridate::year(recording_date_time),
+                  gps_enabled = dplyr::case_when(grepl('\\$', file_name) ~ TRUE),
+                  year = lubridate::year(recording_date_time)) %>%
+    dplyr::arrange(location, recording_date_time) %>%
+    # Create time index
+    dplyr::group_by(location, year, julian) %>%
+    dplyr::mutate(time_index = dplyr::row_number()) %>% # This serves as a ordered count of recordings per day.
+    dplyr::ungroup()
+
+  # Check whether anything was returned
+  if (nrow(df) == 0) {
+    stop (
+      "There were no files of the type specified in file_path in the directory path specified."
+    )
+  }
+
+  if (extra_cols == FALSE) {
+    df_final_simple <- df # Omit the extra columns if chosen
+  } else {
+
+    df_unsafe <- df %>%
+      filter(unsafe == "Unsafe")
+    df <- df %>%
+      filter(unsafe == "Safe")
+
+    # wav files first
+    if ("wav" %in% df$file_type) {
+      df_wav <- df %>>%
+        "Working on wav files..." %>>%
+        dplyr::filter(file_type == "wav") %>% #Make sure things are safe if needed
+        dplyr::mutate(data = furrr::future_map(.x = file_path, .f = ~ tuneR::readWave(.x, from = 0, to = Inf, units = "seconds", header = TRUE), .progress = TRUE, .options = furrr_options(seed = TRUE))) %>%
+        dplyr::mutate(length_seconds = purrr::map_dbl(.x = data, .f = ~ round(purrr::pluck(.x[["samples"]]) / purrr::pluck(.x[["sample.rate"]]), 2)),
+                      sample_rate = purrr::map_dbl(.x = data, .f = ~ round(purrr::pluck(.x[["sample.rate"]]), 2)),
+                      n_channels = purrr::map_dbl(.x = data, .f = ~ purrr::pluck(.x[["channels"]]))) %>%
+        dplyr::select(-c(data, unsafe))
+
+    }
+
+    #Then wac files
+    if ("wac" %in% df$file_type) {
+      df_wac <- df %>>%
+        "Working on wac files..." %>>%
+        dplyr::filter(file_type == "wac") %>%
+        dplyr::mutate(info = furrr::future_map(.x = file_path, .f = ~ wt_wac_info(.x), .progress = TRUE, .options = furrr_options(seed = TRUE)),
+                      sample_rate = purrr::map_dbl(.x = info, .f = ~ purrr::pluck(.x[["sample_rate"]])),
+                      length_seconds = purrr::map_dbl(.x = info, .f = ~ round(purrr::pluck(.x[["length_seconds"]]), 2)),
+                      n_channels = purrr::map_dbl(.x = info, .f = ~ purrr::pluck(.x[["n_channels"]]))) %>%
+        dplyr::select(-c(info, unsafe))
+    }
+
+    #Finally flac
+    if ("flac" %in% df$file_type) {
+      df_flac <- df %>>%
+        "Working on flac files..." %>>%
+        dplyr::filter(file_type == "flac") %>%
+        dplyr::mutate(data = furrr::future_map(.x = file_path, .f = ~ seewave::wav2flac(.x, reverse = TRUE), .progress = TRUE, .options = furrr_options(seed = TRUE)),
+                      sample_rate = purrr::map_dbl(.x = data, .f = ~ purrr::pluck(.x[["sample_rate"]])),
+                      length_seconds = purrr::map_dbl(.x = data, .f = ~ round(purrr::pluck(.x[["length_seconds"]]), 2)),
+                      n_channels = purrr::map_dbl(.x = data, .f = ~ purrr::pluck(.x[["n_channels"]]))) %>%
+        dplyr::select(-c(data, unsafe))
+    }
+  }
+
+  # Stitch together
+  if (rlang::env_has(rlang::current_env(), "df_final_simple")) {
+    df_final <- df_final_simple
+  } else if (exists("df_wav") & !exists("df_wac") & !exists("df_flac")) {
+    df_final <- dplyr::bind_rows(df_wav, df_unsafe)
+  } else if (exists("df_wav") & exists("df_wac") & !exists("df_flac")) {
+    df_final <- dplyr::bind_rows(df_wav, df_wac, df_unsafe)
+  } else if (exists("df_wav") & !exists("df_wac") & exists("df_flac")) {
+    df_final <- dplyr::bind_rows(df_wav, df_flac, df_unsafe)
+  } else if (!exists("df_wav") & exists("df_wac") & !exists("df_flac")) {
+    df_final <- dplyr::bind_rows(df_wac, df_unsafe)
+  } else if (!exists("df_wav") & !exists("df_wac") & exists("df_flac")) {
+    df_final <- dplyr::bind_rows(df_flac, df_unsafe)
+  } else if (!exists("df_wav") & exists("df_wac") & exists("df_flac")) {
+    df_final <- dplyr::bind_rows(df_wac, df_flac, df_unsafe)
+  } else if (exists("df_wav") & exists("df_wac") & exists("df_flac")) {
+    df_final <- dplyr::bind_rows(df_wac, df_wav, df_flac, df_unsafe)
+  }
+
+  # Return final data frame
+  return(df_final)
+
+}
+
+wt_wac_info <- function(path) {
+  if (tools::file_ext(path) != "wac") {
+    stop("This is not a wac file.")
+  }
+
+  f <- file(path, open = "rb")
+  on.exit(close(f))
+
+  name <- readChar(f, 4)
+  version <-
+    readBin(
+      con = f,
+      what = integer(),
+      size = 1,
+      endian = "little"
+    )
+  n_channels <-
+    readBin(
+      con = f,
+      what = integer(),
+      size = 1,
+      endian = "little"
+    )
+  frame_size <-
+    readBin(
+      con = f,
+      what = integer(),
+      size = 2,
+      endian = "little"
+    )
+  block_size <-
+    readBin(
+      con = f,
+      what = integer(),
+      size = 2,
+      endian = "little"
+    )
+  flags <-
+    readBin(
+      con = f,
+      what = integer(),
+      size = 2,
+      endian = "little"
+    )
+  sample_rate <-
+    readBin(
+      con = f,
+      what = integer(),
+      size = 4,
+      endian = "little"
+    )
+  samples <-
+    readBin(
+      con = f,
+      what = integer(),
+      size = 4,
+      endian = "little"
+    )
+
+  if (n_channels == 1) {
+    stereo <- FALSE
+  } else {
+    stereo <- TRUE
+  }
+
+  length_seconds = samples / sample_rate
+
+  return(
+    out = list(
+      sample_rate = sample_rate,
+      n_channels = n_channels,
+      length_seconds = length_seconds
+    )
+  )
+
+}
+```
+
+## What does Cirrus have to do with WildTrax?
+
+Cirrus is a server administered by the University of Alberta SRIT. The Bioacoustic Unit and its collaborators use Cirrus to house and standardize their acoustic data sets for redundancy or permanent storage on a cost-recovery basis. Cirrus contains a variety of different types of data but a large majority of the volume is currently being occupied with environmental sensor data i.e. acoustic recordings and remote camera images. 
+
+Recordings are scanned and selected from when you connect to Cirrus in order to create a project in WildTrax.
+
+## How do I connect to Cirrus?
+
+There are three main ways to connect to Cirrus: SSH, samba/CIFS/NFS or FTP. 
+
+- SSH (or secure shell) provides a secure connection over an unsecured network by connecting a client (you) to the server. SSH is generally used to access Unix-like operating systems, but it can also be used on Microsoft Windows. Windows 10 uses OpenSSH as its default SSH client and SSH server. 
+- CIFS and Samba are file sharing protocols but are unsecured, therefore you need a VPN client like the one at the University of Alberta to connect. If you’re off campus, you will also need to use a VPN in order to connect via samba. Please see here for more information and contact the Department for information about CCIDs. Note that the BU does not control or manage CCIDs. 
+- The FTP or file transfer protocol allows users outside the University of Alberta to easily upload to Cirrus using open-source software like Filezilla. 
+
+<br>
+<br>
+
+**Samba Shares**
+
+Share name: BUdata  
+Type: Read + Write  
+Host: nfs1.wildtrax.ca/BUdata  
+Username: Contact server admins  
+PW: Contact server admins  
+Contains: Read + write to all organizations and data  
+Purpose: Administrator access to all data stored on the Cirrus server from constructed symlinks or bind mounts.  
+
+<br>
+Share Name: BUworkspace  
+Type: Read + Write  
+Host: nfs2.wildtrax.ca/BUworkspace  
+Username: bu-work  
+PW: Amm0sp1za  
+Contains: Bayne lab Graduate student and Bioacoustic Unit research and development. E.g. recognizers.  
+Purpose: Disk space to store audio files, recognizers, outputs, and to manipulate data with write privileges on Cirrus. Links from other areas of Cirrus can be constructed here.  
+
+<br>
+Share name: BUpublic  
+Type: Read  
+Host: nfs3.wildtrax.ca/BUpublic  
+Username: bu-public  
+PW: 3mpid0nax  
+Contains: Read access to ABMI, BU and other collaborative organizations’ and projects’ data  
+Purpose: Data can be selected from here and uploaded to WildTrax for processing or run through recognizers. See wildRtrax for more information on how to scan and pick files, how to authenticate to obtain WildTrax data through R and general concepts around audio data standards.  
+
+## How can I get a list of files from Cirrus?
+
+The `wildRtrax` package contains a function `wt_audio_scanner` allowing you recursively scan a list of files from a Cirrus directory when you have it mapped via samba
+
+```{r, include=T, eval=T, warning=F, message=F}
+# Depends how you mount via Windows it will be the drive letter e.g. Z:\
+# Below is how it would mount on a macOS by default
+relative_root <- "/volumes"
+
+# Scan a directory - each "level" corresponds to a 
+# standard hierarchical structure for data management purposes
+files <-
+  wt_audio_scanner(
+    path = paste0(relative_root, "/BUdata/BU/ARU/AM/2022/V1/AM-401/AM-401-NE"),
+    file_type = "all",
+    extra_cols = T,
+    tz = "US/Mountain"
+  )
+
+# BUdata <- the samba share
+# BU <- The organization
+# ARU <- The sensor 
+# AM  <- The field project, e.g. AM = Amphibians
+# 2022 <- The year of the study
+# V1 <- The visit
+# AM-401 <- The group or cluster
+# AM-401-NE <- The location
+# Below this level will be all the files
+
+head(files)
+
+```
+
+## Does my data follow the standard folder hierarchy?
+
+We can use a *very* simple tidy pipeline to look at the current data hierarchy of a project and determine if it follows the standard. The "standard" here is ambiguous as it depends on your study design. Here are some examples:
+
+```{r}
+# Let's see how long it takes to scan folders over the network.
+tic("timer")
+
+# These are the ABMI Northern Focal Areas AKA Big Grids
+dirs <- dir_info("/Volumes/BUdata/ABMI/ARU/ABMI-BG/2019", 
+               type = c("directory","symlink"), 
+               recurse = T) # Scan the subdirectories 
+
+toc()
+
+```
+
+`type = "symlink"` corresponds to symbolic links. Because data does not exist on the same server stack, symlinks are constructed within the samba share in order for you to see all BUdata. 
+
+```{r}
+# This is counting the "levels" of the folder structure 
+dir_list <- dirs %>%
+  select(path) %>%
+  mutate(level = case_when(str_count(path,"/") == 5 ~ "Project",
+                           str_count(path,"/") == 6 ~ "Year",
+                           str_count(path,"/") == 7 ~ "Visit",
+                           str_count(path,"/") == 8 ~ "Group",
+                           str_count(path,"/") == 9 ~ "Location",
+                           TRUE ~ "NA"),
+         strp_last = str_extract(path,"[^\\/]+$"))
+
+dir_count <- dir_list %>%
+  group_by(level) %>%
+  tally()
+
+dir_count
+
+```
+
+This shows there is one year sampling, one visit (i.e. 1 ARU deployment per year), 2 groups (i.e. 2 Big Grids) and 100 locations. The locations are individual folders containing the media where the location string in the file name corresponds to the folder name. 
+
+You could determine programmatically if the structure makes sense:
+
+```{r}
+dir_count$n[[1]] < dir_count$n[[2]]
+  
+```
+
+The locations outnumber the groups which makes sense because a cluster of points should be less than the number of points themselves. This concept of a *group* is completely dependent on need and study design. You don't need a group to construct the hierarchy as long the file name prefix matches the folder name above it. Here is an example of a project without groups:
+
+```{r}
+# BAM 2022 re-visit locations
+dirs2 <- dir_info("/Volumes/BUdata/BU/ARU/BAM/2022", 
+               type = c("directory","symlink"), 
+               recurse = T) %>%
+  select(path) %>%
+  mutate(level = case_when(str_count(path,"/") == 5 ~ "Project",
+                           str_count(path,"/") == 6 ~ "Year",
+                           str_count(path,"/") == 7 ~ "Visit",
+                           str_count(path,"/") == 8 ~ "Location", # No groups
+                           TRUE ~ "NA"),
+         strp_last = str_extract(path,"[^\\/]+$"))
+
+head(dirs2)
+```
+
+```{r}
+dir_count2 <- dirs2 %>%
+  group_by(level) %>%
+  tally()
+
+dir_count2
+
+```
+
+And here a project where there are groups but they number the locations as there is only one location per treatment.
+
+```{r}
+# Post-disturbance temporal gradient
+dirs3 <- dir_info("/Volumes/BUdata/BU/ARU/PDTG", 
+               type = c("directory","symlink"), 
+               recurse = T) %>%
+  select(path) %>%
+  mutate(level = case_when(str_count(path,"/") == 5 ~ "Project",
+                           str_count(path,"/") == 6 ~ "Year",
+                           str_count(path,"/") == 7 ~ "Visit",
+                           str_count(path,"/") == 8 ~ "Group",
+                           str_count(path,"/") == 9 ~ "Location", # One location per group
+                           TRUE ~ "NA"),
+         strp_last = str_extract(path,"[^\\/]+$"))
+
+head(dirs3)
+```
+
+
+```{r}
+dir_count3 <- dirs3 %>%
+  group_by(level) %>%
+  tally()
+
+dir_count3
+
+```
+
+Hmm... wait what was that "NA" back the ABMI-BG data?
+
+```{r}
+dir_count
+
+```
+
+Let's find out why there's a folder that doesn't follow the hierarchy
+
+```{r}
+dir_list %>%
+  filter(level == "NA")
+
+```
+
+Ah it's one of those **Data** folders that come from the SD card on a Wildlife Acoustics ARU. You'll need to contact Alex or Erin in order to delete folders or move files because you're only a **read** user when you login via Samba to BUpublic.
+
+Finally, you can always start scanning files from this point given you have the folder paths.
+
+```{r}
+dir_list %>%
+  filter(level == "Location") %>%
+  slice(1) %>% # Just one for the sake of simplicity
+  mutate(files = map(
+    .x = path,
+    .f = ~ wt_audio_scanner(
+      path = .x,
+      file_type = "all",
+      extra_cols = F
+    )
+  ))
+  
+```
+
+## How can I download a list of recordings from WildTrax?
+
+Go to the Organization > Recordings Tab > Manage > Download List of Recordings.
+
+```{r, eval=T, include=T, eval=T, warning=F, message=F}
+# Change this to your local directory where you'll be downloading the csv from WildTrax
+local_dir <- "/users/alexandremacphail/desktop/"
+
+recs <-
+  read_csv(paste0(
+    local_dir,
+    "Bioacoustic_Unit_recordings_20221208_202319UTC.csv"
+  )) 
+```
+
+Note the date-time is recorded at UTC from when it was downloaded. This allows you to differentiate between csvs if recordings are being uploaded simultaneously by multiple users, or to "rollback" any recording records in case any are deleted from WildTrax.
+
+We're also going to bring together the location and date-time into a file name *string* that will be used to match to recording name on Cirrus.
+
+```{r}
+recs_with_filename <- recs %>%
+  mutate(filename_string = paste0(location, "_", format(recordingDate, "%Y%m%d_%H%M%S"))) 
+
+recs_with_filename %>%
+  select(location, recordingDate, filename_string)
+
+```
+
+## How can I select recordings to upload to WildTrax without getting conflict errors?
+
+<br> 
+
+You can either filter a list from another,
+
+```{r, eval=T, include=T, warning=F, message=F}
+exists <- recs_with_filename %>% 
+  filter(filename_string %in% files$file_name) %>%
+  pull()
+
+# Here there are 5 files in WildTrax for this location year
+
+head(exists)
+
+```
+
+<br> 
+
+or perform an `inner_join`.
+
+```{r, eval=T, include=T, warning=F, message=F}
+recs_with_filename %>%
+  inner_join(., files, by = c("filename_string" = "file_name"))
+
+```
+
+<br> 
+
+Pick some random recordings excluding the ones already in WildTrax:
+
+```{r, eval=T, include=T, warning=F, message=F}
+picked <- files %>%
+  filter(!file_name %in% exists) %>%
+  group_by(location) %>%
+  sample_n(4, replace = F)
+
+picked
+
+```
+
+## What's the best way to organize these files for upload to WildTrax?
+
+If you use a Unix-based operating system, you can create symbolic links to the files on Cirrus in order to organize them for upload.
+
+If you're a Windows user, you'll need to copy the files.
+
+```{r, eval=F, include=T, warning=F, message=F}
+output_dir <- "/path/to/my/local/dir"
+
+# Unix work flow
+picked %>%
+  map(.x = path, .f = ~file.symlink(.x, to = output_dir))
+
+# Windows work flow
+picked %>%
+  map(.x = path, .f = ~file.copy(.x, to = output_dir))
+
+```
+
+You can then select this folder of files when you upload to WildTrax via either:
+
+- My Organizations > Recordings > Upload Recordings if you only want to upload the media
+- My Projects > *Create a project* > Manage > Upload Recordings to Project if you want to upload the recordings and generate processing tasks
+
+If you're on a Unix-based machine, make sure to *safely* remove the links you create. If you try deleting the files you might get an error and if you connect via BUworkspace or BUdata you risk deleting the original file as you would have **read and write access**.
+
+Safe:
+
+```{bash, eval=F, include=T}
+
+echo $'find . -type l -delete'
+
+echo $'unlink symlink_file'
+
+```
